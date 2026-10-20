@@ -1,0 +1,8 @@
+android/.work/
+__pycache__/
+*.pyc
+*.pyo
+*.idsig
+.idea/
+.DS_Store
+Thumbs.db
