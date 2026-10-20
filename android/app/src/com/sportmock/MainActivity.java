@@ -18,7 +18,7 @@ import android.widget.Toast;
 
 public class MainActivity extends Activity {
 
-    private EditText etLat, etLon, etLaps, etPace, etPath;
+    private EditText etLat, etLon, etLaps, etPace, etVar, etPath;
     private TextView tvState;
     private Button btnStart, btnStop;
     private float dp;
@@ -41,6 +41,7 @@ public class MainActivity extends Activity {
         etLon = numEdit("113.160746");
         etLaps = numEdit("3");
         etPace = numEdit("360");
+        etVar = numEdit("0.35");
 
         label(root, "自定义路线（推荐）：lat,lon;lat,lon;…  留空则跑椭圆");
         etPath = new EditText(this);
@@ -60,6 +61,8 @@ public class MainActivity extends Activity {
         root.addView(etLaps);
         label(root, "配速 秒每公里（6'00\" = 360）");
         root.addView(etPace);
+        label(root, "配速起伏 0~1（0.35 推荐；0 = 全程匀速，容易被判机器人）");
+        root.addView(etVar);
 
         btnStart = new Button(this);
         btnStart.setText("开始模拟");
@@ -113,10 +116,12 @@ public class MainActivity extends Activity {
         Double lon = parse(etLon);
         Double laps = parse(etLaps);
         Double pace = parse(etPace);
+        Double variRaw = parse(etVar);
         if (lat == null || lon == null || laps == null || pace == null) {
             Toast.makeText(this, "有参数格式不对", Toast.LENGTH_SHORT).show();
             return;
         }
+        double vari = variRaw == null ? 0.35 : Math.max(0.0, Math.min(1.0, variRaw.doubleValue()));
         if (pace < 120) {
             Toast.makeText(this, "配速太小，会被判超速", Toast.LENGTH_SHORT).show();
             return;
@@ -129,6 +134,7 @@ public class MainActivity extends Activity {
         i.putExtra("lon", lon.doubleValue());
         i.putExtra("laps", laps.doubleValue());
         i.putExtra("pace", pace.doubleValue());
+        i.putExtra("variability", vari);
         i.putExtra("path", path);
         startForegroundService(i);
 

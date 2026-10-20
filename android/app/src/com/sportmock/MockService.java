@@ -23,6 +23,21 @@ public class MockService extends Service {
     private static final double RADIUS = 36.80;
     private static final double JITTER = 2.5;
     private static final long INTERVAL = 1000L;
+    // 配速模型常量：真人跑不会匀速，这里用「慢漂移 + 随机游走 + 每秒微抖 + 偶发冲刺/停步」
+    // 拟合瞬时速度，距离按实际积分累加（不再是 s = elapsed * 固定速度）。
+    private static final double WARMUP_SEC = 12.0;   // 起步加速
+    private static final double COOLDOWN_M = 35.0;   // 收尾减速的距离
+    private static final double SPEED_FLOOR = 0.15;  // 相对基准速度的下限
+    private static final double SPEED_CEIL = 1.65;   // 上限，别跑出人类配速
+
+    private double baseSpeed = 2.5;      // m/s
+    private double variability = 0.35;   // 起伏强度 0~1
+    private double driftPhase1, driftPhase2;
+    private double driftPeriod1 = 210.0, driftPeriod2 = 97.0;
+    private double walk = 0.0;           // 随机游走项
+    private double burstUntil = -1, burstFactor = 1.0;
+    private double restUntil = -1;
+    private double nextEventAt = 45.0;
 
     private LocationManager lm;
     private volatile boolean running = false;
@@ -104,7 +119,9 @@ public class MockService extends Service {
         double rawLon = intent == null ? 121.0 : intent.getDoubleExtra("lon", 121.0);
         final double laps = intent == null ? 4.0 : intent.getDoubleExtra("laps", 4.0);
         final double pace = intent == null ? 390.0 : intent.getDoubleExtra("pace", 390.0);
+        final double vari = intent == null ? 0.35 : intent.getDoubleExtra("variability", 0.35);
         String pathSpec = intent == null ? null : intent.getStringExtra("path");
+        variability = Math.max(0.0, Math.min(1.0, vari));
 
         buildRoute(pathSpec);
 
@@ -248,15 +265,29 @@ public class MockService extends Service {
 
     private void runTrack(double lat0, double lon0, double laps, double pace) {
         double mLat = 111320.0;
-        double speed = 1000.0 / pace;
+        baseSpeed = 1000.0 / pace;
+        driftPhase1 = rnd.nextDouble() * Math.PI * 2;
+        driftPhase2 = rnd.nextDouble() * Math.PI * 2;
+        driftPeriod1 = 150.0 + rnd.nextDouble() * 180.0;
+        driftPeriod2 = 45.0 + rnd.nextDouble() * 80.0;
+        walk = 0.0;
+        nextEventAt = 40.0 + rnd.nextDouble() * 50.0;
+
         double loop = route != null ? routeLen : 400.0;
         double total = laps * loop;
+        double s = 0.0;
         long t0 = SystemClock.elapsedRealtime();
+        long lastTick = t0;
 
         try {
             while (running) {
-                double elapsed = (SystemClock.elapsedRealtime() - t0) / 1000.0;
-                double s = elapsed * speed;
+                long nowMs = SystemClock.elapsedRealtime();
+                double t = (nowMs - t0) / 1000.0;
+                double dt = Math.max(0.2, Math.min(3.0, (nowMs - lastTick) / 1000.0));
+                lastTick = nowMs;
+
+                double v = speedAt(s, total, t, dt);
+                s += v * dt;
                 if (s > total) break;
 
                 double jLat, jLon, bx, by;
@@ -280,28 +311,76 @@ public class MockService extends Service {
                 float bearing = (float) Math.toDegrees(Math.atan2(bx, by));
                 if (bearing < 0f) bearing += 360f;
 
-                long now = System.currentTimeMillis();
+                long wall = System.currentTimeMillis();
                 long nowNs = SystemClock.elapsedRealtimeNanos();
+                // 精度随速度浮动：慢下来（走/停）时定位更飘，符合真实表现
+                float acc = (float) (2.5 + rnd.nextDouble() * 2.0 + (v < baseSpeed * 0.5 ? 2.5 : 0.0));
 
                 for (String name : providers) {
                     Location loc = new Location(name);
                     loc.setLatitude(jLat);
                     loc.setLongitude(jLon);
-                    loc.setAccuracy(3.0f);
-                    loc.setSpeed((float) speed);
+                    loc.setAccuracy(acc);
+                    loc.setSpeed((float) v);
                     loc.setBearing(bearing);
                     loc.setAltitude(20.0 + (rnd.nextDouble() * 2.0 - 1.0));
-                    loc.setTime(now);
+                    loc.setTime(wall);
                     loc.setElapsedRealtimeNanos(nowNs);
                     lm.setTestProviderLocation(name, loc);
                 }
-                Thread.sleep(INTERVAL);
+                // 更新间隔抖动 ±80ms：真实 GPS 回调不是精确 1s 一次
+                long sleep = INTERVAL + (long) (rnd.nextInt(160) - 80);
+                Thread.sleep(Math.max(700L, sleep));
             }
         } catch (InterruptedException ignored) {
         } catch (SecurityException ignored) {
         } finally {
             releaseProvider();
         }
+    }
+
+    /**
+     * 瞬时速度（m/s）：基准速度 × 起伏系数。
+     * 系数 = 1 + variability × (慢漂移 + 随机游走 + 微抖)，再乘起步/收尾/冲刺/停步修正。
+     */
+    private double speedAt(double s, double total, double t, double dt) {
+        // 随机游走：OU 风格，缓慢回归 0，避免长时间越飘越远
+        walk += rnd.nextGaussian() * 0.02;
+        walk *= 0.985;
+        walk = Math.max(-0.45, Math.min(0.45, walk));
+
+        double drift = 0.11 * Math.sin(2 * Math.PI * t / driftPeriod1 + driftPhase1)
+                + 0.07 * Math.sin(2 * Math.PI * t / driftPeriod2 + driftPhase2);
+        double factor = 1.0 + variability * (drift + walk)
+                + variability * 0.012 * rnd.nextGaussian();
+
+        if (t < WARMUP_SEC) {
+            double k = t / WARMUP_SEC;
+            factor *= 0.35 + 0.65 * k;          // 起步：从走路速度提到目标配速
+        }
+        double remain = total - s;
+        if (remain < COOLDOWN_M && total > COOLDOWN_M * 2) {
+            factor *= 0.55 + 0.45 * (remain / COOLDOWN_M);   // 收尾：逐渐慢下来
+        }
+
+        // 偶发事件：冲刺一段 / 短暂停步（等灯、喘口气）
+        if (t >= nextEventAt) {
+            double roll = rnd.nextDouble();
+            if (roll < 0.30) {
+                burstUntil = t + 8.0 + rnd.nextDouble() * 12.0;
+                burstFactor = 1.08 + rnd.nextDouble() * 0.16;
+                nextEventAt = t + 60.0 + rnd.nextDouble() * 120.0;
+            } else if (roll < 0.55) {
+                restUntil = t + 1.5 + rnd.nextDouble() * 2.5;
+                nextEventAt = t + 60.0 + rnd.nextDouble() * 120.0;
+            } else {
+                nextEventAt = t + 30.0 + rnd.nextDouble() * 60.0;
+            }
+        }
+        if (t < burstUntil) factor *= burstFactor;
+        if (t < restUntil) factor *= 0.22;
+
+        return Math.max(baseSpeed * SPEED_FLOOR, Math.min(baseSpeed * SPEED_CEIL, baseSpeed * factor));
     }
 
     private double gauss() {
