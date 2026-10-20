@@ -116,15 +116,30 @@ com.tencent.map    (腾讯地图)
 
 **验证顺序：先用腾讯地图当探针**，它认了再开微信。
 
+### 传感器合成（Hook 1.2+）
+
+位置是假的，但手机的人是**真静止**的：计步器读数恒为 0、加速度计只剩重力。
+这比"模拟位置"更容易被戳穿。Hook 1.2 起在目标应用里包一层
+`SensorEventListener`，事件到达应用前改写成跑步波形：
+
+| 传感器 | 改写为 |
+|---|---|
+| `TYPE_ACCELEROMETER` | 9.81 重力 + 1.8 Hz 步频振荡 |
+| `TYPE_LINEAR_ACCELERATION` | 同上，去掉重力 |
+| `TYPE_STEP_COUNTER` | 接住系统基线后按 168 步/分 累加，接得上真实读数 |
+| `TYPE_STEP_DETECTOR` | 每次事件置 1 |
+| `TYPE_GYROSCOPE` | 小幅摆动噪声 |
+
+只 hook 应用自己的 `SensorManager`，没注册传感器的应用完全不受影响；
+合成失败时原样透传，不会把目标应用带崩。
+
 ### 还没做的
 
-| 缺口 | 影响 | 补法 |
+| 缺口 | 影响 | 备注 |
 |---|---|---|
-| 传感器数据 | 计步器（`TYPE_STEP_COUNTER`）读数是 0，加速度计静止 | 在 Hook 里 hook `SystemSensorManager$SensorEventQueue.dispatchSensorEvent`，按配速合成步频波形（需要真机调试） |
-| GNSS 卫星状态 | `GnssStatus` 回调没有卫星，精度突然变成 3 m 本身可疑 | hook `GnssStatus` / `getGnssStatus` |
-| 基站 / WiFi 扫描 | 网络定位为空 | 需要 root 伪造扫描结果，成本高 |
-
-只查坐标的独立校园跑 App 通常不需要这些；如果它读取计步或加速度，就得补第 1 项。
+| GNSS 卫星状态 | 手机真实 GNSS 仍在收星，只是定位结果被 mock 覆盖；对比原始 NMEA 会发现不一致 | 极少有 App 这么做，成本高收益低 |
+| 基站 / WiFi 扫描 | 扫描结果仍是真实环境，与注入坐标不符 | 需要 root 伪造，成本高 |
+| 真机验证 | 传感器改写只有真机才能确认，LSPosed 作用域、ROM 差异都可能影响 | **需要 root 手机实测** |
 
 ---
 
