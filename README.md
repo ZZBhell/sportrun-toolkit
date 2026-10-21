@@ -114,32 +114,55 @@ com.tencent.mm     (微信)
 com.tencent.map    (腾讯地图)
 ```
 
-**验证顺序：先用腾讯地图当探针**，它认了再开微信。
+**验证顺序：先用高德地图当探针**（实测接受注入坐标），确认位置注入正常工作；
+腾讯系（腾讯地图/微信）会识别 mock，需要 Hook 才过。
 
-### 传感器合成（Hook 1.2+）
+### 传感器合成（Hook 1.3）
 
 位置是假的，但手机的人是**真静止**的：计步器读数恒为 0、加速度计只剩重力。
-这比"模拟位置"更容易被戳穿。Hook 1.2 起在目标应用里包一层
-`SensorEventListener`，事件到达应用前改写成跑步波形：
+这比"模拟位置"更容易被戳穿。Hook 在目标应用里包一层 `SensorEventListener`：
 
-| 传感器 | 改写为 |
+| 传感器 | 处理方式 |
 |---|---|
-| `TYPE_ACCELEROMETER` | 9.81 重力 + 1.8 Hz 步频振荡 |
-| `TYPE_LINEAR_ACCELERATION` | 同上，去掉重力 |
-| `TYPE_STEP_COUNTER` | 接住系统基线后按 168 步/分 累加，接得上真实读数 |
-| `TYPE_STEP_DETECTOR` | 每次事件置 1 |
-| `TYPE_GYROSCOPE` | 小幅摆动噪声 |
+| `TYPE_ACCELEROMETER` | 9.81 重力 + 1.8 Hz 步频振荡（改写事件） |
+| `TYPE_LINEAR_ACCELERATION` | 同上，去掉重力（改写事件） |
+| `TYPE_STEP_COUNTER` | **主动注入**：接住系统基线后按 168 步/分自己造事件 |
+| `TYPE_STEP_DETECTOR` | **主动注入**：每次置 1 |
+| `TYPE_GYROSCOPE` | 小幅摆动噪声（改写事件） |
 
-只 hook 应用自己的 `SensorManager`，没注册传感器的应用完全不受影响；
-合成失败时原样透传，不会把目标应用带崩。
+⚠️ 计步器是**事件驱动**的：手机静止时系统根本不会回调 `onSensorChanged`，
+所以 1.2 那种"改写已有事件"的写法在静止时永远拿不到步数。1.3 改成自己起定时器
+主动造 `SensorEvent` 喂给目标监听器，真实计步事件则被吞掉，避免两套计数打架。
+
+其它要点：
+
+- 覆盖 `registerListener` 的 3/4/5 参重载，`unregisterListener` 时停掉注入线程；
+- `Location.isFromMockProvider()` / `isMock()` 返回 `false`；
+- `Settings.Secure.getString(cr, "mock_location")` 返回 `null`（干净设备上这个 key 本来就不存在，返回 `"0"` 反而可能触发「非空即异常」的判断）；
+- 定位 `Location` 附带 `satellites` / `meanCn0` / `maxCn0` 的 extras，模拟真实 GPS 的卫星信息（部分 SDK 会读）。
 
 ### 还没做的
 
 | 缺口 | 影响 | 备注 |
 |---|---|---|
 | GNSS 卫星状态 | 手机真实 GNSS 仍在收星，只是定位结果被 mock 覆盖；对比原始 NMEA 会发现不一致 | 极少有 App 这么做，成本高收益低 |
+| `TYPE_GNSS_*` 原生回调 | 走原生 GNSS 回调的 App hook 不到 | 视目标 App 实测 |
 | 基站 / WiFi 扫描 | 扫描结果仍是真实环境，与注入坐标不符 | 需要 root 伪造，成本高 |
 | 真机验证 | 传感器改写只有真机才能确认，LSPosed 作用域、ROM 差异都可能影响 | **需要 root 手机实测** |
+
+---
+
+## 更新记录
+
+| 版本 | 变更 |
+|---|---|
+| SportMock 1.6 | 修复重复启动时 `ConcurrentModificationException`（两个 worker 同时改 provider 列表）；`Location` 补 satellites/CN0 extras |
+| Hook 1.3 | 计步器改主动注入；`mock_location` 返回 null；补 5 参 `registerListener` 与 `unregisterListener` 清理 |
+| SportMock 1.5 | 配速模型（漂移 + 随机游走 + 冲刺/停步）、注入间隔抖动、精度随速度变化 |
+| Hook 1.2 | 首次加入传感器合成（加速度计/陀螺仪/计步器改写） |
+
+实测结论：**高德系**（AMap SDK）接受注入坐标，免 root 即可用；**腾讯系**
+（腾讯地图、微信小程序定位 SDK）会识别 mock 并回退真实网络定位，必须 root + LSPosed 隐藏。
 
 ---
 

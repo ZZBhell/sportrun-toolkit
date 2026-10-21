@@ -9,6 +9,7 @@ import android.content.pm.ServiceInfo;
 import android.location.Location;
 import android.location.LocationManager;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.IBinder;
 import android.os.SystemClock;
 
@@ -139,6 +140,21 @@ public class MockService extends Service {
         startForegroundCompat();
 
         lm = (LocationManager) getSystemService(LOCATION_SERVICE);
+        // 重入保护：上一轮还在跑就先停掉，否则两个 worker 会同时改 providers，
+        // 旧 worker 的 finally 里 releaseProvider() 在遍历时被新 worker 的
+        // prepareProvider() 清空，抛 ConcurrentModificationException 把进程带崩。
+        if (running || worker != null) {
+            running = false;
+            if (worker != null) {
+                worker.interrupt();
+                try {
+                    worker.join(1500);
+                } catch (InterruptedException ignored) {
+                }
+                worker = null;
+            }
+            releaseProvider();
+        }
         if (!prepareProvider()) {
             stopSelf();
             return START_NOT_STICKY;
@@ -232,25 +248,35 @@ public class MockService extends Service {
                 "fused",
                 LocationManager.PASSIVE_PROVIDER
         };
-        providers.clear();
-        for (String name : names) {
-            try {
+        // providers 会被 mock-track 线程和 onStartCommand 线程同时读写，
+        // 统一在 providers 对象上加锁，避免并发修改崩溃。
+        synchronized (providers) {
+            providers.clear();
+            for (String name : names) {
                 try {
-                    lm.removeTestProvider(name);
+                    try {
+                        lm.removeTestProvider(name);
+                    } catch (Exception ignored) {
+                    }
+                    lm.addTestProvider(name,
+                            false, true, false, false, true, true, true, 1, 1);
+                    lm.setTestProviderEnabled(name, true);
+                    providers.add(name);
                 } catch (Exception ignored) {
                 }
-                lm.addTestProvider(name,
-                        false, true, false, false, true, true, true, 1, 1);
-                lm.setTestProviderEnabled(name, true);
-                providers.add(name);
-            } catch (Exception ignored) {
             }
+            return !providers.isEmpty();
         }
-        return !providers.isEmpty();
     }
 
     private void releaseProvider() {
-        for (String name : providers) {
+        // 先取快照再逐个释放：不在遍历过程中让别的线程改这个 list
+        java.util.List<String> snapshot;
+        synchronized (providers) {
+            snapshot = new java.util.ArrayList<String>(providers);
+            providers.clear();
+        }
+        for (String name : snapshot) {
             try {
                 lm.setTestProviderEnabled(name, false);
             } catch (Exception ignored) {
@@ -260,7 +286,6 @@ public class MockService extends Service {
             } catch (Exception ignored) {
             }
         }
-        providers.clear();
     }
 
     private void runTrack(double lat0, double lon0, double laps, double pace) {
@@ -326,6 +351,15 @@ public class MockService extends Service {
                     loc.setAltitude(20.0 + (rnd.nextDouble() * 2.0 - 1.0));
                     loc.setTime(wall);
                     loc.setElapsedRealtimeNanos(nowNs);
+
+                    // 真机 GPS 的 Location 一般带卫星信息（satellites / meanCn0 / maxCn0）。
+                    // 这些字段缺失是"假定位"最便宜的一条识别特征，补上成本几乎为零。
+                    Bundle ex = new Bundle();
+                    ex.putInt("satellites", 8 + rnd.nextInt(5));
+                    ex.putDouble("meanCn0", 30.0 + rnd.nextDouble() * 10.0);
+                    ex.putDouble("maxCn0", 42.0);
+                    loc.setExtras(ex);
+
                     lm.setTestProviderLocation(name, loc);
                 }
                 // 更新间隔抖动 ±80ms：真实 GPS 回调不是精确 1s 一次
